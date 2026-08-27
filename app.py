@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-SELECTIVE PRECIPITATION SIMULATOR
+SELECTIVE PRECIPITATION WITH CHELATING AGENT SIMULATOR
 =================================
 
 Thermodynamic screening model for competitive metal precipitation
