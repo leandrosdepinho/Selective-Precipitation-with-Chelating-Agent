@@ -525,8 +525,7 @@ def solve_equilibrium(
     metals,
     complexant_total,
     precipitant_total,
-    complexant_pk
-as,
+    complexant_pkas,
     precipitant_pkas
 ):
     """
