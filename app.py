@@ -19,6 +19,12 @@ ASSUMPTIONS
 6. No mixed hydroxo-complexes, ternary complexes, polymeric species,
    or competing solid phases are included.
 7. A mild Savitzky-Golay filter is used only for visualization.
+8. The free-metal concentration is taken as the MORE RESTRICTIVE of the
+   two competing equilibria (complexation-only mass balance vs. the
+   precipitation solubility ceiling) rather than solved as a single
+   fully simultaneous multi-equilibrium system — see the note on
+   `_metal_free_and_soluble` below for exactly what this does and does
+   not capture.
 """
 
 import streamlit as st
@@ -26,7 +32,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
-from scipy.optimize import root_scalar
 
 
 # ============================================================
@@ -392,8 +397,16 @@ CHEMICAL_DATABASE = {
     },
 
 
+    # NOTE (fixed): pKa2 harmonized to 4.27 to match the "Oxalate"
+    # precipitant entry above. The two entries describe the SAME real
+    # species (the oxalate anion) and previously disagreed (4.14 vs
+    # 4.27) even though they should be identical — see category 4
+    # ("Erros a corrigir") in the accompanying review for the full
+    # explanation. This does not, by itself, make it correct to
+    # select both "Oxalate" and "Oxalate Complex" at the same time
+    # (see the double-role warning added to the UI section below).
     "Oxalate Complex": {
-        "pkas": [1.25, 4.14],
+        "pkas": [1.25, 4.27],
         "log_betas": {
 
             "Al3+": [6.1, 11.1, 15.1],
@@ -412,6 +425,15 @@ CHEMICAL_DATABASE = {
 }
 
 
+# Maps a precipitant/complexant name to the underlying real chemical
+# species it represents, so the UI can warn when the SAME species is
+# picked for both roles at once (see "Erros a corrigir", item 3).
+_UNDERLYING_SPECIES = {
+    "Oxalate": "oxalate",
+    "Oxalate Complex": "oxalate",
+}
+
+
 # ============================================================
 # 2. HELPER FUNCTIONS
 # ============================================================
@@ -419,7 +441,29 @@ CHEMICAL_DATABASE = {
 def calculate_alpha_inverse(pH, pkas):
     """
     Calculates 1/alpha for the fully deprotonated ligand/anion.
+
+    For an n-protic acid H_nX with successive (stepwise) dissociation
+    constants Ka_1, ..., Ka_n (pkas given in ascending order, i.e.
+    Ka_1 is the FIRST, strongest-acid dissociation and Ka_n is the
+    LAST, weakest one), the fraction present as the fully deprotonated
+    species X^n- is the standard polyprotic-acid distribution fraction:
+
+        alpha_X = (Ka_1 * Ka_2 * ... * Ka_n) / D
+
+        D = [H+]^n + Ka_1[H+]^(n-1) + Ka_1Ka_2[H+]^(n-2)
+            + ... + Ka_1*Ka_2*...*Ka_n
+
+    so that
+
+        1/alpha_X = [H+]^n/(Ka_1...Ka_n) + [H+]^(n-1)/(Ka_2...Ka_n)
+                    + ... + [H+]/Ka_n + 1
+
+    The loop below builds exactly this sum by walking the Ka list
+    from the LAST (weakest) dissociation back to the first, which is
+    algebraically identical to the expression above (each term of
+    the sum re-uses the running product of the trailing Ka's).
     """
+
     h = 10.0 ** (-pH)
     kas = [10.0 ** (-pka) for pka in pkas]
 
@@ -441,9 +485,20 @@ def get_complex_parameters(complexant_name, metal_name):
         N = number of ligands in the highest complex
         logBeta = highest cumulative logBeta
 
-    If the metal is absent from the database:
-        no stable complex is assumed.
+    If the metal is absent from the database, or no complexant is in
+    use (complexant_name is None), no stable complex is assumed —
+    this only switches OFF the complexation/masking effect for that
+    metal; it does NOT switch off its precipitation behaviour, which
+    is governed entirely by the separate precipitant database.
     """
+
+    if complexant_name is None:
+        return {
+            "active": False,
+            "N": 0,
+            "beta": 0.0,
+            "log_beta": 0.0
+        }
 
     complexant = CHEMICAL_DATABASE[complexant_name]
 
@@ -520,6 +575,156 @@ def build_metal_system(selected_metals, concentrations, precipitant_name,
 # 3. CORE EQUILIBRIUM ENGINE
 # ============================================================
 
+# Bisection is done in log10-space rather than on the raw concentration
+# (see `_bisect_log` docstring for the full justification). This floor
+# stands in for "effectively zero" free-species concentration.
+LOG_FREE_SPECIES_FLOOR = -300.0
+BISECTION_ITERATIONS = 60
+
+
+def _equilibrium_free_metal_ceiling(ksp, x, y, A_free):
+    """
+    Solves the precipitation equilibrium M_x A_y(s) <-> xM + yA for the
+    ceiling it imposes on the free (uncomplexed) metal ion concentration:
+
+        Ksp = [M]^x [A]^y   =>   [M]_ceiling = (Ksp / [A]^y) ** (1/x)
+
+    This is computed through base-10 logarithms rather than by directly
+    evaluating A_free**y, because A_free can legitimately be as small as
+    1e-100 or smaller when several very insoluble solids are competing
+    for a shared, finite anion pool (see `_bisect_log`). For y=4 or 5
+    (several phosphates in this database), A_free**y underflows to
+    EXACTLY 0.0 in double precision once A_free drops below roughly
+    1e-77 (y=4) or 1e-62 (y=5) — and Ksp divided by a literal 0.0 raises
+    ZeroDivisionError in plain Python. Working in logs sidesteps this:
+    the ceiling is simply enormous (no precipitation constraint) rather
+    than the code crashing.
+    """
+
+    A_free = max(A_free, 1e-300)
+
+    log_ceiling = (
+        np.log10(ksp) - y * np.log10(A_free)
+    ) / x
+
+    if log_ceiling > 300.0:
+        return np.inf
+
+    return 10.0 ** log_ceiling
+
+
+def _metal_free_and_soluble(m, A_free, Y_free):
+    """
+    Given trial free concentrations of the precipitating anion (A_free)
+    and the complexing agent (Y_free), returns (M_free, M_soluble,
+    M_precipitated) for one metal system `m`.
+
+    Two independent equilibria each constrain the free (uncomplexed)
+    metal ion concentration [M]:
+
+    (a) Complexation mass balance alone (M + N*Y <-> MY_N, beta):
+            M_initial = [M] + [MY_N] = [M] * (1 + beta*[Y]^N)
+        =>  [M] = M_initial / (1 + beta*[Y]^N)
+        This is the free-metal concentration IF every bit of the metal
+        stayed dissolved (as free ion + complex) with nothing removed
+        as a solid.
+
+    (b) The precipitation equilibrium alone caps the free ion at
+            [M]_ceiling = (Ksp / [A]^y) ** (1/x)
+        (see `_equilibrium_free_metal_ceiling`).
+
+    The model takes the free metal ion concentration to be whichever
+    of the two is SMALLER — i.e. whichever equilibrium is the more
+    restrictive one wins:
+
+        [M] = min( M_initial / (1 + beta*[Y]^N),  [M]_ceiling )
+
+    This is exact in the two limiting regimes (pure complexation with
+    no precipitation ceiling reached, or pure precipitation with no
+    complexation) but is an approximation — not a full simultaneous
+    solve of both mass-action laws for a single free [M] — in the
+    narrow transition zone where neither constraint is overwhelmingly
+    tighter than the other. This is declared explicitly as assumption
+    #8 above; it is the same approximation the model relies on
+    throughout, not a separate error.
+
+    Total dissolved (soluble) metal is then free + complexed, computed
+    from the REAL (possibly capped) free metal so that reducing the
+    free ion via precipitation also correctly reduces how much
+    complexed metal can coexist with it.
+    """
+
+    if m["complex_active"]:
+        complex_term = m["Beta"] * (Y_free ** m["N"])
+    else:
+        complex_term = 0.0
+
+    M_from_complexation = m["M_initial"] / (1.0 + complex_term)
+
+    M_ceiling = _equilibrium_free_metal_ceiling(
+        m["Ksp"], m["x"], m["y"], A_free
+    )
+
+    M_free = min(M_from_complexation, M_ceiling)
+
+    M_soluble = M_free * (1.0 + complex_term)
+    M_soluble = min(m["M_initial"], M_soluble)
+
+    M_precipitated = max(0.0, m["M_initial"] - M_soluble)
+
+    return M_free, M_soluble, M_precipitated
+
+
+def _bisect_log(residual_fn, log_high, iterations=BISECTION_ITERATIONS):
+    """
+    Finds the root of `residual_fn` (a function of a real, non-negative
+    free-species concentration) known to lie in (0, 10**log_high], by
+    substituting x = 10**u and bisecting on u = log10(x) instead of on
+    x directly.
+
+    WHY THIS MATTERS: depending on how insoluble a solid or how stable
+    a complex is, the true root can sit anywhere from ~1 M down to well
+    under 1e-50 M. Bisecting on the RAW concentration with a fixed
+    iteration budget means that budget has to cover the full distance
+    from the starting bound down to wherever the actual root happens to
+    be — if the root is many orders of magnitude below the starting
+    bound, a modest, fixed number of iterations runs out of resolution
+    long before it gets close, and the value it settles on is
+    effectively numerical noise. Because the equilibrium formulas raise
+    that free-species concentration to a stoichiometric power (y or N,
+    up to 5 in this database), even a small relative error at that
+    point gets amplified into a large, pH/dose-dependent swing in the
+    computed % precipitated — which is what produces visibly jittery
+    curves, and becomes more likely to show up the more metals (and
+    therefore the more extreme Ksp/beta values) are mixed together in
+    one run.
+
+    Bisecting on log10(x) instead makes each iteration halve the number
+    of ORDERS OF MAGNITUDE remaining rather than halving an absolute
+    distance, so the same fixed iteration budget resolves a root at
+    1e-80 exactly as well as one at 1e-1.
+
+    This function assumes residual_fn(~0) <= 0 and
+    residual_fn(10**log_high) >= 0, which holds for every mass-balance
+    residual used in this script (the "total" supplied always at least
+    matches what the free-species term alone would require).
+    """
+
+    low_u = LOG_FREE_SPECIES_FLOOR
+    high_u = log_high
+
+    for _ in range(iterations):
+
+        mid_u = 0.5 * (low_u + high_u)
+
+        if residual_fn(10.0 ** mid_u) < 0:
+            low_u = mid_u
+        else:
+            high_u = mid_u
+
+    return 10.0 ** (0.5 * (low_u + high_u))
+
+
 def solve_equilibrium(
     pH,
     metals,
@@ -530,6 +735,17 @@ def solve_equilibrium(
 ):
     """
     Solves the coupled metal / complexant / precipitant system.
+
+    There are two mutually coupled unknowns: the free precipitating
+    anion concentration (A_free) and the free complexant concentration
+    (Y_free) — each metal's free/soluble/precipitated split depends on
+    BOTH (see `_metal_free_and_soluble`), and both A_free and Y_free
+    are themselves solved from mass balances that sum over every
+    selected metal. The system is solved as a NESTED equilibrium: for
+    any trial A_free, `calculate_free_complexant` fully resolves the
+    self-consistent Y_free that goes with it; the outer solve then
+    adjusts A_free until the precipitant mass balance is satisfied
+    using that inner solution.
 
     Returns percentage precipitation for each metal.
     """
@@ -551,246 +767,93 @@ def solve_equilibrium(
     )
 
     # --------------------------------------------------------
-    # Special case: no precipitant
+    # Special case: no precipitant at all. With no competing solid
+    # phase in this model (hydroxide, etc. — see assumptions), nothing
+    # can precipitate regardless of whether complexation is active.
     # --------------------------------------------------------
 
     if precipitant_total <= 0.0:
-
-        output = {}
-
-        for m in metals:
-
-            if complexant_active and m["complex_active"]:
-
-                # If only complexation exists, no precipitation occurs
-                # without the precipitating agent.
-                soluble = m["M_initial"]
-
-            else:
-                soluble = m["M_initial"]
-
-            output[m["name"]] = 0.0
-
-        return output
+        return {m["name"]: 0.0 for m in metals}
 
     # --------------------------------------------------------
-    # Function to calculate free complexant for a given
-    # free precipitating anion.
+    # Inner solve: free complexant concentration for a given trial
+    # free precipitating-anion concentration.
     # --------------------------------------------------------
 
     def calculate_free_complexant(A_free):
 
-        A_free = max(A_free, 1e-40)
-
-        low_y = 0.0
-
-        if complexant_active:
-            high_y = complexant_total / alpha_Y_inv
-        else:
+        if not complexant_active:
             return 0.0
 
-        for _ in range(70):
+        high_y = complexant_total / alpha_Y_inv
 
-            Y_free = (low_y + high_y) / 2.0
+        if high_y <= 0.0:
+            return 0.0
+
+        def residual(Y_free):
 
             calculated_complexant = Y_free * alpha_Y_inv
 
             for m in metals:
 
-                if m["complex_active"]:
+                if not m["complex_active"]:
+                    continue
 
-                    complex_term = (
-                        m["Beta"] *
-                        (Y_free ** m["N"])
-                    )
-
-                else:
-                    complex_term = 0.0
-
-                M_from_complexation = (
-                    m["M_initial"] /
-                    (1.0 + complex_term)
+                M_free, _, _ = _metal_free_and_soluble(
+                    m, A_free, Y_free
                 )
 
-                M_ksp = (
-                    m["Ksp"] /
-                    (A_free ** m["y"])
-                ) ** (1.0 / m["x"])
-
-                M_free = min(
-                    M_from_complexation,
-                    M_ksp
+                complexed_metal = (
+                    m["Beta"] * M_free * (Y_free ** m["N"])
                 )
 
-                if m["complex_active"]:
+                calculated_complexant += m["N"] * complexed_metal
 
-                    complexed_metal = (
-                        m["Beta"] *
-                        M_free *
-                        (Y_free ** m["N"])
-                    )
+            return calculated_complexant - complexant_total
 
-                    calculated_complexant += (
-                        m["N"] * complexed_metal
-                    )
-
-            if calculated_complexant < complexant_total:
-                low_y = Y_free
-            else:
-                high_y = Y_free
-
-        return (low_y + high_y) / 2.0
+        return _bisect_log(residual, np.log10(high_y))
 
     # --------------------------------------------------------
-    # Precipitant mass-balance equation
+    # Outer solve: precipitant mass-balance equation.
     # --------------------------------------------------------
 
     def precipitant_balance(A_free):
 
-        A_free = max(A_free, 1e-40)
-
         Y_free = calculate_free_complexant(A_free)
 
-        calculated_precipitant = (
-            A_free * alpha_A_inv
-        )
+        calculated_precipitant = A_free * alpha_A_inv
 
         for m in metals:
 
-            if m["complex_active"]:
-
-                complex_term = (
-                    m["Beta"] *
-                    (Y_free ** m["N"])
-                )
-
-            else:
-                complex_term = 0.0
-
-            M_without_precipitation = (
-                m["M_initial"] /
-                (1.0 + complex_term)
-            )
-
-            M_ksp = (
-                m["Ksp"] /
-                (A_free ** m["y"])
-            ) ** (1.0 / m["x"])
-
-            M_free = min(
-                M_without_precipitation,
-                M_ksp
-            )
-
-            M_soluble = (
-                M_free *
-                (1.0 + complex_term)
-            )
-
-            M_soluble = min(
-                m["M_initial"],
-                M_soluble
-            )
-
-            M_precipitated = max(
-                0.0,
-                m["M_initial"] - M_soluble
+            _, _, M_precipitated = _metal_free_and_soluble(
+                m, A_free, Y_free
             )
 
             calculated_precipitant += (
-                (m["y"] / m["x"]) *
-                M_precipitated
+                (m["y"] / m["x"]) * M_precipitated
             )
 
-        return (
-            calculated_precipitant -
-            precipitant_total
-        )
+        return calculated_precipitant - precipitant_total
 
-    # --------------------------------------------------------
-    # Solve for free precipitating anion
-    # --------------------------------------------------------
+    upper_bound_A = max(precipitant_total / alpha_A_inv, 1e-300)
 
-    upper_bound = (
-        precipitant_total /
-        alpha_A_inv
-    )
-
-    upper_bound = max(
-        upper_bound,
-        1e-40
-    )
-
-    try:
-
-        f_low = precipitant_balance(1e-40)
-        f_high = precipitant_balance(upper_bound)
-
-        if f_low * f_high <= 0:
-
-            solution = root_scalar(
-                precipitant_balance,
-                bracket=[1e-40, upper_bound],
-                method="brentq"
-            )
-
-            A_free_actual = solution.root
-
-        else:
-            A_free_actual = upper_bound
-
-    except Exception:
-        A_free_actual = upper_bound
-
-    # --------------------------------------------------------
-    # Final free complexant
-    # --------------------------------------------------------
-
-    Y_free_final = calculate_free_complexant(
-        A_free_actual
+    A_free_actual = _bisect_log(
+        precipitant_balance,
+        np.log10(upper_bound_A)
     )
 
     # --------------------------------------------------------
-    # Final precipitation calculation
+    # Final, self-consistent free complexant and results.
     # --------------------------------------------------------
+
+    Y_free_final = calculate_free_complexant(A_free_actual)
 
     results = {}
 
     for m in metals:
 
-        if m["complex_active"]:
-
-            complex_term = (
-                m["Beta"] *
-                (Y_free_final ** m["N"])
-            )
-
-        else:
-            complex_term = 0.0
-
-        M_without_precipitation = (
-            m["M_initial"] /
-            (1.0 + complex_term)
-        )
-
-        M_ksp = (
-            m["Ksp"] /
-            (max(A_free_actual, 1e-40) ** m["y"])
-        ) ** (1.0 / m["x"])
-
-        M_free = min(
-            M_without_precipitation,
-            M_ksp
-        )
-
-        M_soluble = (
-            M_free *
-            (1.0 + complex_term)
-        )
-
-        M_soluble = min(
-            m["M_initial"],
-            M_soluble
+        _, M_soluble, _ = _metal_free_and_soluble(
+            m, A_free_actual, Y_free_final
         )
 
         if m["M_initial"] > 0:
@@ -803,11 +866,11 @@ def solve_equilibrium(
         else:
             precipitation_pct = 0.0
 
-        results[m["name"]] = np.clip(
+        results[m["name"]] = float(np.clip(
             precipitation_pct,
             0.0,
             100.0
-        )
+        ))
 
     return results
 
@@ -868,6 +931,28 @@ complexant_name = st.sidebar.selectbox(
 )
 
 use_complexant = complexant_name != "None"
+
+# FIX (added): warn when the precipitant and the complexant are
+# actually the SAME underlying chemical species (currently only
+# "Oxalate" vs. "Oxalate Complex"). The model keeps a separate,
+# independent total-concentration mass balance for each role; picking
+# the same real anion for both is equivalent to assuming there are
+# two distinct pools of oxalate in solution, which is not physically
+# coherent — there is only one pool of free oxalate serving both
+# functions at once.
+if (
+    _UNDERLYING_SPECIES.get(precipitant_name) is not None
+    and _UNDERLYING_SPECIES.get(precipitant_name)
+    == _UNDERLYING_SPECIES.get(complexant_name)
+):
+    st.sidebar.warning(
+        f"'{precipitant_name}' and '{complexant_name}' are modeled as "
+        "the same real species (oxalate), but the simulator tracks "
+        "them as two INDEPENDENT total-concentration pools. Using "
+        "both together assumes twice as much free oxalate as is "
+        "physically present. Results for this combination should be "
+        "treated as illustrative only."
+    )
 
 
 # ============================================================
@@ -1018,11 +1103,20 @@ concentration_points = st.sidebar.slider(
 # BUILD SYSTEM
 # ============================================================
 
+# FIX: pass None (not a fallback "EDTA") when no complexant is in use,
+# so that the metal-system records — and therefore the "View selected
+# chemical parameters" panel below — correctly show "No complex" for
+# every metal instead of silently reporting real EDTA log β values for
+# a complexation effect that isn't actually switched on in the
+# simulation. The simulation itself was never affected by this (Y_free
+# is forced to 0 whenever no complexant is active, which always zeroes
+# out the complexation term regardless of which beta values were
+# loaded) — this fix only corrects what the info panel displays.
 metals = build_metal_system(
     selected_metals,
     concentrations,
     precipitant_name,
-    complexant_name if use_complexant else "EDTA"
+    complexant_name if use_complexant else None
 )
 
 
@@ -1426,13 +1520,23 @@ with st.expander(
 - When several cumulative β values are available, the highest β is used,
   with `N` equal to the corresponding number of ligand molecules.
 - A metal absent from the selected complexant database is treated as
-  having no stable complex with that complexant.
+  having no stable complex with that complexant (this only disables the
+  complexation effect for that metal; it still precipitates normally
+  according to the precipitant database).
 - Protonation of both the complexant and precipitating anion is included
   through the corresponding α factors.
 - Precipitation is controlled by the selected Ksp and the stoichiometric
   coefficients `x` and `y`.
+- The free-metal concentration is taken as whichever of the two
+  competing equilibria (complexation mass balance vs. precipitation
+  solubility ceiling) is more restrictive — an approximation, not a
+  fully simultaneous solve of both mass-action laws at once.
 - Mixed complexes, ternary species, hydroxo-complexes, polymeric species,
   redox reactions, and competing solid phases are not included.
+- "Oxalate" (precipitant) and "Oxalate Complex" (complexant) represent
+  the same real anion but are tracked as independent total-concentration
+  pools; selecting both at once double-counts the available oxalate
+  (see the warning shown when this combination is selected).
 
 ### Interpretation
 
