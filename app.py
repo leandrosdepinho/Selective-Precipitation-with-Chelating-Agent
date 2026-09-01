@@ -1,60 +1,5 @@
 # -*- coding: utf-8 -*-
 
-"""
-SELECTIVE PRECIPITATION WITH CHELATING AGENT SIMULATOR
-======================================================
-
-Thermodynamic screening model for competitive metal precipitation
-in the presence of a chelating/complexing agent.
-
-GENERAL ASSUMPTIONS
--------------------
-1. Ideal solution: activity coefficients = 1.
-2. Thermodynamic constants are treated at 25 °C.
-3. Kinetic effects are neglected.
-4. Adsorption and occlusion are neglected.
-5. Temperature effects are neglected.
-
-SPECIFIC MODEL ASSUMPTIONS
---------------------------
-1. Each metal-ligand pair is represented by ONE effective global complex:
-
-       M + N Y <-> MY_N
-
-   using the highest available cumulative logBeta value.
-
-2. The selected complex is treated as one effective stoichiometric species.
-
-3. Protonation of the complexant and precipitating anion is represented
-   through alpha factors.
-
-4. Only the fully deprotonated ligand/precipitating-anion species is
-   considered in the complexation and precipitation equilibria.
-
-5. No mixed hydroxo-complexes, ternary complexes, polymeric species,
-   or competing solid phases are included.
-
-6. The free-metal concentration is taken as the MORE RESTRICTIVE of the
-   two competing equilibria (complexation-only mass balance vs.
-   precipitation solubility ceiling), rather than solving the complete
-   simultaneous multi-equilibrium system.
-
-7. If no complexation constant is available for a metal-ligand pair,
-   this is classified as "No data". For calculation purposes, the model
-   assumes that no stable complex is represented for that pair. This is
-   NOT interpreted as proof that the metal cannot form a complex.
-
-8. Savitzky-Golay filtering is used ONLY for graphical visualization.
-   The numerical equilibrium results are not replaced by the smoothed
-   values used in the plots.
-
-IMPORTANT MODEL LIMITATION
---------------------------
-The model is intended as a thermodynamic screening/triage tool rather
-than a complete aqueous-speciation solver.
-"""
-
-
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -802,22 +747,6 @@ def solve_equilibrium(
     complexant_pkas,
     precipitant_pkas
 ):
-    """
-    Solves the coupled metal / complexant / precipitant system.
-
-    The unknown free precipitating anion concentration and free
-    complexant concentration are coupled through the metal balances.
-
-    A nested numerical solution is used:
-
-    1. For a trial free precipitating-anion concentration,
-       solve the free complexant concentration.
-
-    2. Adjust the free precipitating-anion concentration until
-       the total precipitant mass balance is satisfied.
-
-    Returns the percentage precipitation of each selected metal.
-    """
 
     if len(metals) == 0:
 
@@ -2085,64 +2014,4 @@ with st.expander(
 
         hide_index=True
 
-    )
-
-
-# ============================================================
-# MODEL NOTES
-# ============================================================
-
-with st.expander(
-    "Model assumptions and limitations"
-):
-
-    st.markdown(
-        """
-### Model assumptions
-
-- Ideal solution: activity coefficients are assumed to be 1.
-- Equilibrium constants are treated as thermodynamic values at 25 °C.
-- Kinetic effects are not represented.
-- Adsorption and occlusion are not represented.
-- Temperature effects are not represented.
-- Each metal–complexant pair is represented by one effective global complex.
-- When several cumulative β values are available, the highest β is used,
-  with `N` equal to the corresponding number of ligand molecules.
-- The complexation and precipitation equilibria are represented using
-  the fully deprotonated forms of the complexant and precipitating anion.
-- Protonation of the complexant and precipitating anion is incorporated
-  through their respective α factors.
-- Precipitation is controlled by the selected Ksp and stoichiometric
-  coefficients `x` and `y`.
-- Mixed complexes, ternary species, hydroxo-complexes, polymeric species,
-  redox reactions, and competing solid phases are not included.
-- The free-metal concentration is taken as whichever of the two
-  competing constraints (complexation mass balance vs. precipitation
-  solubility ceiling) is more restrictive. This is an explicit modeling
-  approximation rather than a fully simultaneous solution of all
-  mass-action equations.
-- When a metal–complexant pair has no available stability constant in
-  the database, the database reports "No data". For the calculation,
-  that pair is treated as having no stable complex represented by the
-  model. "No data" must therefore NOT be interpreted as experimental
-  evidence that no complex exists.
-- Oxalate Complex cannot be selected when Oxalate is the precipitating
-  agent because both entries represent the same underlying chemical
-  species. Allowing both roles simultaneously would require two
-  independent oxalate pools and would violate the intended mass balance.
-
-### Numerical vs. graphical results
-
-The equilibrium solver produces the raw numerical precipitation values.
-
-A Savitzky-Golay filter is applied only to the curves displayed in the
-graphs, in order to improve visual readability. The numerical results
-shown in the tables remain unsmoothed.
-
-### Interpretation
-
-The concentration axis represents the total analytical concentration
-of the precipitating agent, not the concentration of its fully
-deprotonated free species.
-"""
     )
