@@ -533,7 +533,7 @@ def _equilibrium_free_metal_ceiling(
 
 def _metal_free_and_soluble(
     m,
-    A_free,
+    M_ceiling,
     Y_free
 ):
 
@@ -552,15 +552,6 @@ def _metal_free_and_soluble(
 
         m["M_initial"]
         / (1.0 + complex_term)
-
-    )
-
-    M_ceiling = _equilibrium_free_metal_ceiling(
-
-        m["Ksp"],
-        m["x"],
-        m["y"],
-        A_free
 
     )
 
@@ -599,15 +590,44 @@ def _metal_free_and_soluble(
     )
 
 
+def _bracket_log(
+    residual_fn,
+    log_low,
+    log_high,
+    scan_points=80
+):
+
+    us = np.linspace(log_low, log_high, scan_points)
+
+    prev_u = us[0]
+    prev_r = residual_fn(10.0 ** prev_u)
+
+    if prev_r >= 0:
+        return log_low, log_low
+
+    for u in us[1:]:
+
+        r = residual_fn(10.0 ** u)
+
+        if r >= 0:
+            return prev_u, u
+
+        prev_u, prev_r = u, r
+
+    return prev_u, log_high
+
+
 def _bisect_log(
     residual_fn,
     log_high,
     iterations=BISECTION_ITERATIONS
 ):
 
-    low_u = LOG_FREE_SPECIES_FLOOR
-
-    high_u = log_high
+    low_u, high_u = _bracket_log(
+        residual_fn,
+        LOG_FREE_SPECIES_FLOOR,
+        log_high
+    )
 
     for _ in range(iterations):
 
@@ -709,6 +729,21 @@ def solve_equilibrium(
             return 0.0
 
 
+        # M_ceiling depends only on A_free (fixed for this call),
+        # never on the Y_free being solved for below. Computing it
+        # once here — instead of once per bisection step — removes
+        # ~60x redundant work per pH/concentration point.
+        ceilings = {
+
+            m["name"]: _equilibrium_free_metal_ceiling(
+                m["Ksp"], m["x"], m["y"], A_free
+            )
+
+            for m in metals
+
+        }
+
+
         def residual(
             Y_free
         ):
@@ -729,7 +764,7 @@ def solve_equilibrium(
                 M_free, _, _ = (
                     _metal_free_and_soluble(
                         m,
-                        A_free,
+                        ceilings[m["name"]],
                         Y_free
                     )
                 )
@@ -792,11 +827,17 @@ def solve_equilibrium(
 
         for m in metals:
 
+            M_ceiling = (
+                _equilibrium_free_metal_ceiling(
+                    m["Ksp"], m["x"], m["y"], A_free
+                )
+            )
+
             _, _, M_precipitated = (
 
                 _metal_free_and_soluble(
                     m,
-                    A_free,
+                    M_ceiling,
                     Y_free
                 )
 
@@ -856,10 +897,16 @@ def solve_equilibrium(
 
     for m in metals:
 
+        M_ceiling_final = (
+            _equilibrium_free_metal_ceiling(
+                m["Ksp"], m["x"], m["y"], A_free_actual
+            )
+        )
+
         _, M_soluble, _ = (
             _metal_free_and_soluble(
                 m,
-                A_free_actual,
+                M_ceiling_final,
                 Y_free_final
             )
         )
@@ -911,15 +958,7 @@ st.set_page_config(
 
 
 st.title(
-    "🧪 Selective Precipitation Simulator"
-)
-
-
-st.markdown(
-    """
-Thermodynamic screening of competitive metal precipitation
-in the presence of a complexing agent.
-"""
+    "🧪 Competitive metal precipitation in the presence of a complexing agent"
 )
 
 
@@ -1422,48 +1461,37 @@ df_pH = pd.DataFrame(
 # VISUAL SMOOTHING ONLY
 # ------------------------------------------------------------
 
-# IMPORTANT:
-# The equilibrium calculations stored in df_pH are the actual
-# numerical outputs of solve_equilibrium().
-#
-# Smoothing is applied only to a copy used for plotting.
-# The numerical equilibrium table remains unsmoothed.
+def _smooth_for_plot(series):
+
+    n = len(series)
+
+    window = max(5, min(31, (n // 20) | 1))
+
+    if n <= window:
+        return series
+
+    try:
+
+        smoothed = savgol_filter(
+            series,
+            window_length=window,
+            polyorder=2
+        )
+
+        return np.clip(smoothed, 0, 100)
+
+    except Exception:
+
+        return series
+
 
 df_pH_plot = df_pH.copy()
 
+for metal in selected_metals:
 
-if len(df_pH_plot) >= 51:
-
-    for metal in selected_metals:
-
-        try:
-
-            df_pH_plot[metal] = (
-                savgol_filter(
-
-                    df_pH_plot[metal],
-
-                    window_length=11,
-
-                    polyorder=2
-
-                )
-            )
-
-
-            df_pH_plot[metal] = np.clip(
-
-                df_pH_plot[metal],
-
-                0,
-
-                100
-
-            )
-
-        except Exception:
-
-            pass
+    df_pH_plot[metal] = _smooth_for_plot(
+        df_pH_plot[metal].to_numpy()
+    )
 
 
 # ------------------------------------------------------------
@@ -1723,41 +1751,11 @@ df_concentration_plot = (
     df_concentration.copy()
 )
 
+for metal in selected_metals:
 
-if len(df_concentration_plot) >= 51:
-
-    for metal in selected_metals:
-
-        try:
-
-            df_concentration_plot[metal] = (
-
-                savgol_filter(
-
-                    df_concentration_plot[metal],
-
-                    window_length=11,
-
-                    polyorder=2
-
-                )
-
-            )
-
-
-            df_concentration_plot[metal] = np.clip(
-
-                df_concentration_plot[metal],
-
-                0,
-
-                100
-
-            )
-
-        except Exception:
-
-            pass
+    df_concentration_plot[metal] = _smooth_for_plot(
+        df_concentration_plot[metal].to_numpy()
+    )
 
 
 # ------------------------------------------------------------
