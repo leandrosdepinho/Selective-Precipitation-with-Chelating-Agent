@@ -370,25 +370,7 @@ CHEMICAL_DATABASE = {
 # ============================================================
 
 def calculate_alpha_inverse(pH, pkas):
-    """
-    Calculates 1/alpha for the fully deprotonated species.
-
-    For an n-protic acid H_nX with successive dissociation constants:
-
-        Ka_1, Ka_2, ..., Ka_n
-
-    the fraction present as the fully deprotonated species X^(n-)
-    is represented by the standard polyprotic-acid distribution
-    expression.
-
-    The function returns:
-
-        1 / alpha_X
-
-    which converts total analytical concentration into the
-    concentration of the fully deprotonated free species.
-    """
-
+ 
     h = 10.0 ** (-pH)
     kas = [10.0 ** (-pka) for pka in pkas]
 
@@ -408,29 +390,7 @@ def calculate_alpha_inverse(pH, pkas):
 
 
 def get_complex_parameters(complexant_name, metal_name):
-    """
-    Returns the effective ONE-complex approximation.
-
-    If multiple cumulative beta values exist:
-
-        N = number of ligands in the highest complex
-        logBeta = highest cumulative logBeta
-
-    If the metal is absent from the complexant database, the status is
-    "No data". This means there is no complexation constant available
-    in the current database.
-
-    For the numerical model, "No data" is treated as no stable complex
-    being represented. This does NOT mean that the metal is chemically
-    incapable of complexing with the ligand.
-
-    A beta value explicitly equal to zero is also treated as
-    "No stable complex represented" for the numerical calculation,
-    because logBeta = 0 corresponds to beta = 1 and is not a meaningful
-    stability enhancement in the context of this simplified masking
-    model.
-    """
-
+ 
     if complexant_name is None:
         return {
             "active": False,
@@ -552,23 +512,6 @@ def _equilibrium_free_metal_ceiling(
     y,
     A_free
 ):
-    """
-    Solves the precipitation equilibrium for the maximum
-    free metal concentration compatible with the solid phase:
-
-        M_x A_y(s) <-> xM + yA
-
-        Ksp = [M]^x [A]^y
-
-    Therefore:
-
-        [M]_ceiling =
-            (Ksp / [A]^y)^(1/x)
-
-    The calculation is performed in logarithmic space to avoid
-    numerical underflow for extremely small free-anion
-    concentrations.
-    """
 
     A_free = max(
         A_free,
@@ -593,46 +536,6 @@ def _metal_free_and_soluble(
     A_free,
     Y_free
 ):
-    """
-    Calculates the free metal, total dissolved metal and
-    precipitated metal for one metal system.
-
-    The model considers two constraints on free metal:
-
-    1. Complexation-only mass balance:
-
-       M_initial =
-           [M] + [MY_N]
-
-       with
-
-       [MY_N] =
-           beta [M][Y]^N
-
-       giving
-
-       [M] =
-           M_initial /
-           (1 + beta[Y]^N)
-
-    2. Precipitation equilibrium:
-
-       [M] <= [M]_ceiling
-
-    The model therefore uses:
-
-       [M] =
-           min(
-               M_from_complexation,
-               M_ceiling
-           )
-
-    This is an explicit modeling approximation rather than
-    a full simultaneous solution of every mass-action equation.
-
-    The total dissolved metal is then reconstructed from
-    the actual free-metal concentration.
-    """
 
     if m["complex_active"]:
 
@@ -701,16 +604,6 @@ def _bisect_log(
     log_high,
     iterations=BISECTION_ITERATIONS
 ):
-    """
-    Finds a root of residual_fn in logarithmic concentration space.
-
-    The substitution
-
-        x = 10^u
-
-    allows the solver to resolve roots spanning many orders
-    of magnitude without losing numerical resolution.
-    """
 
     low_u = LOG_FREE_SPECIES_FLOOR
 
